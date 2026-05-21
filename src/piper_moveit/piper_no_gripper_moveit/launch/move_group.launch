@@ -85,6 +85,9 @@
     <!-- Set the display variable, in case OpenGL code is used internally -->
     <env name="DISPLAY" value="$(optenv DISPLAY :0)" />
 
+    <!-- Read actual robot joint state for planning (filtered: no gripper) -->
+    <remap from="joint_states" to="joint_states_actual" />
+
     <param name="allow_trajectory_execution" value="$(arg allow_trajectory_execution)"/>
     <param name="sense_for_plan/max_safe_path_cost" value="$(arg max_safe_path_cost)"/>
     <param name="default_planning_pipeline" value="$(arg pipeline)" />

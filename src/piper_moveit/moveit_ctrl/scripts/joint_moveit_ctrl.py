@@ -4,7 +4,7 @@ import rospy
 import time
 import random
 from moveit_ctrl.srv import JointMoveitCtrl, JointMoveitCtrlRequest # pyright: ignore[reportAttributeAccessIssue]
-from tf.transformations import quaternion_from_euler
+from tf.transformations import quaternion_from_euler # type: ignore
 
 def call_joint_moveit_ctrl_arm(joint_states, max_velocity=0.5, max_acceleration=0.5):
     rospy.wait_for_service("joint_moveit_ctrl_arm")
@@ -106,7 +106,7 @@ def randomval():
 
     return arm_position, gripper_position
 
-import moveit_commander
+import moveit_commander # type: ignore
 
 def move_robot():
     # 初始化 MoveIt! 相关组件
@@ -169,11 +169,16 @@ def main():
         call_joint_moveit_ctrl_arm(arm_position, max_velocity=0.5, max_acceleration=0.5) # 回零
         time.sleep(1)
 
-from geometry_msgs.msg import Pose, PoseStamped
+from geometry_msgs.msg import Pose, PoseStamped # type: ignore
 import sys
-from tf.transformations import euler_from_quaternion
+import threading
+from tf.transformations import euler_from_quaternion # type: ignore
 import math
 import rospy
+
+# 人眼在机械臂基座坐标系中的位置 (超参数，每台机械臂需单独配置)
+# 法兰盘运动到目标点时 Z 轴会尽可能指向此位置
+EYE_POSITION = (1.0, 0.0, 0.6)  # (x, y, z) 单位: 米，典型值 [1.0, 0.0, 0.0] 或 [1.0, 0.0, 0.5]
 
 class SafetyZoneManager:
     """
@@ -284,7 +289,7 @@ def print_current_pose(move_group):
         f"Roll: {roll_deg:6.1f} deg"
     )
 
-from tf.transformations import quaternion_about_axis, quaternion_multiply
+from tf.transformations import quaternion_about_axis, quaternion_multiply # type: ignore
 
 def get_hybrid_quaternion(yaw_deg, pitch_deg, roll_deg):
     """
@@ -305,6 +310,38 @@ def get_hybrid_quaternion(yaw_deg, pitch_deg, roll_deg):
     q_aim = quaternion_multiply(q_yaw, q_pitch)
     q_final = quaternion_multiply(q_aim, q_roll)
     return list(q_final)
+
+def compute_ideal_yaw_pitch(target_x, target_y, target_z):
+    """
+    从 target 指向 EYE_POSITION 的方向向量，反算理想 (yaw, pitch)。
+    yaw 为方向向量的水平方位角，pitch 为与垂直轴的夹角。
+    返回: (yaw_deg, pitch_deg)
+    """
+    ex, ey, ez = EYE_POSITION
+    dx = ex - target_x
+    dy = ey - target_y
+    dz = ez - target_z
+    yaw_rad = math.atan2(dy, dx)
+    pitch_rad = math.atan2(math.sqrt(dx * dx + dy * dy), dz)
+    return math.degrees(yaw_rad), math.degrees(pitch_rad)
+
+
+def compute_pitch_to_eye(target_x, target_y, target_z, yaw_deg):
+    """
+    计算使法兰盘 Z 轴尽可能指向 EYE_POSITION 的 pitch 角度。
+    在固定 yaw 的前提下，将眼位方向向量投影到法兰盘 Z 轴所在的垂直平面，反算 pitch。
+    """
+    ex, ey, ez = EYE_POSITION
+    dx = ex - target_x
+    dy = ey - target_y
+    dz = ez - target_z
+
+    yaw_rad = math.radians(yaw_deg)
+    proj_xy = dx * math.cos(yaw_rad) + dy * math.sin(yaw_rad)
+
+    pitch_rad = math.atan2(proj_xy, dz)
+    return math.degrees(pitch_rad)
+
 
 def move_to_xyz(move_group, x, y, z, yaw_deg, pitch_deg, roll_deg):
     q = get_hybrid_quaternion(yaw_deg, pitch_deg, roll_deg)
@@ -418,6 +455,133 @@ def move_to_xyz_smart(move_group, x, y, z):
                  f"尝试了所有 Pitch 候选 {pitch_candidates} 均不可达。")
     return False
 
+def _plan_worker(move_group, result_holder):
+    try:
+        result_holder["result"] = move_group.plan()
+    except Exception as e:
+        result_holder["exception"] = e
+
+
+def plan_with_timeout(move_group, hard_timeout=0.5):
+    """
+    带硬超时的 MoveIt 规划。
+    move_group 需预先 set_planning_time() 作为软超时，
+    hard_timeout 为线程级硬超时兜底。
+    返回: (is_success, plan_result, elapsed_sec)
+    """
+    result_holder = {"result": None, "exception": None}
+
+    thread = threading.Thread(
+        target=_plan_worker, args=(move_group, result_holder), daemon=True
+    )
+    t0 = time.time()
+    thread.start()
+    thread.join(timeout=hard_timeout)
+    elapsed = time.time() - t0
+
+    if thread.is_alive():
+        return False, None, elapsed
+
+    if result_holder["exception"]:
+        rospy.logwarn(f"规划异常: {result_holder['exception']}")
+        return False, None, elapsed
+
+    plan_result = result_holder["result"]
+    is_success = plan_result[0] if isinstance(plan_result, tuple) else plan_result
+    return is_success, plan_result, elapsed
+
+
+def move_to_xyz_face_eye(move_group, x, y, z,
+                          yaw_step=10.0, yaw_levels=3,
+                          pitch_step=5.0, pitch_range=20.0):
+    """
+    移动到目标位置 (x, y, z)，同时法兰盘正对 EYE_POSITION。
+    在 (yaw, pitch) 空间中从理想值向外螺旋搜索:
+      - yaw 层次: 理想 → ±step → ±2*step → ...
+      - 每层 yaw 下重算局部理想 pitch，并在附近搜索
+      - 非理想 yaw 时 pitch 搜索范围减半 (yaw 已妥协，不再叠加极端 pitch)
+    Roll 固定为 0。
+    """
+    ideal_yaw, ideal_pitch = compute_ideal_yaw_pitch(x, y, z)
+    ideal_yaw = max(-90.0, min(90.0, ideal_yaw))
+
+    # 极速配置: 0.05s 算不出来大概率就是无解
+    move_group.set_planning_time(0.05)
+    move_group.set_num_planning_attempts(1)
+
+    yaw_offsets = [0.0]
+    for i in range(1, yaw_levels):
+        yaw_offsets.extend([i * yaw_step, -i * yaw_step])
+    yaw_offsets.sort(key=abs)
+
+    rospy.loginfo(f"FaceEye 联合搜索 -> xyz({x:.2f}, {y:.2f}, {z:.2f}) | "
+                  f"理想 (yaw={ideal_yaw:.1f}°, pitch={ideal_pitch:.1f}°) | "
+                  f"yaw 层数 {yaw_levels} 步长 {yaw_step}° | pitch 步长 {pitch_step}°")
+
+    for yaw_off in yaw_offsets:
+        yaw = ideal_yaw + yaw_off
+        if not (-90.0 <= yaw <= 90.0):
+            continue
+
+        local_pitch = compute_pitch_to_eye(x, y, z, yaw)
+        effective_range = pitch_range if abs(yaw_off) < 1e-6 else pitch_range * 0.5
+        num_steps = int(effective_range / pitch_step)
+
+        pitch_candidates = [local_pitch]
+        for i in range(1, num_steps + 1):
+            pitch_candidates.append(local_pitch + i * pitch_step)
+            pitch_candidates.append(local_pitch - i * pitch_step)
+        pitch_candidates = [p for p in pitch_candidates if -120.0 <= p <= 120.0]
+
+        if abs(yaw_off) < 1e-6:
+            rospy.loginfo(f"  搜索 yaw={yaw:.1f}° (理想) 局部pitch={local_pitch:.1f}° "
+                          f"范围 ±{effective_range:.0f}° [{len(pitch_candidates)} 个候选]")
+        else:
+            rospy.loginfo(f"  搜索 yaw={yaw:.1f}° (偏离 {yaw_off:+.0f}°) "
+                          f"局部pitch={local_pitch:.1f}° 范围 ±{effective_range:.0f}° [{len(pitch_candidates)} 个候选]")
+
+        for pitch in pitch_candidates:
+            if rospy.is_shutdown():
+                return False
+
+            q = get_hybrid_quaternion(yaw, pitch, 0.0)
+
+            target_pose = Pose()
+            target_pose.position.x = x
+            target_pose.position.y = y
+            target_pose.position.z = z
+            target_pose.orientation.x = q[0]
+            target_pose.orientation.y = q[1]
+            target_pose.orientation.z = q[2]
+            target_pose.orientation.w = q[3]
+
+            move_group.set_pose_target(target_pose)
+            is_success, plan_result, elapsed = plan_with_timeout(move_group)
+
+            if not plan_result:
+                rospy.loginfo(f"    [{elapsed*1000:5.0f}ms] (yaw={yaw:.0f}° pitch={pitch:.0f}°) 超时/异常，跳过")
+                move_group.clear_pose_targets()
+                continue
+
+            if is_success:
+                yaw_dev = yaw - ideal_yaw
+                pitch_dev = pitch - ideal_pitch
+                rospy.loginfo(f">> FaceEye 成功 [{elapsed*1000:5.0f}ms]: "
+                              f"yaw={yaw:.1f}° (Δ{yaw_dev:+.1f}°) "
+                              f"pitch={pitch:.1f}° (Δ{pitch_dev:+.1f}°)")
+                traj = plan_result[1] if isinstance(plan_result, tuple) else plan_result
+                move_group.execute(traj, wait=True)
+                move_group.stop()
+                move_group.clear_pose_targets()
+                return True
+            else:
+                rospy.loginfo(f"    [{elapsed*1000:5.0f}ms] (yaw={yaw:.0f}° pitch={pitch:.0f}°) 无解")
+
+    rospy.logerr(f"FaceEye 失败: ({x:.2f}, {y:.2f}, {z:.2f}) "
+                 f"在 {yaw_levels} 层 yaw + {pitch_step}° 步长 pitch 搜索内无解。")
+    return False
+
+
 def move_robot_cartesian_demo():
     # 初始化
     moveit_commander.roscpp_initialize(sys.argv)
@@ -453,10 +617,16 @@ def move_robot_cartesian_demo():
 
     rospy.sleep(1)
 
-    # --- 3. 测试 1: 移动到安全区内的点 (应该成功) ---
-    rospy.loginfo("\n--- TEST 1: Moving to a point INSIDE the safety zone ---")
-    x, y, z = 0.4, 0.3, 0.2
-    success = move_to_xyz_smart(move_group, x, y, z)
+    # --- 3. 测试: 移动到目标点，法兰盘正对 EYE_POSITION ---
+    rospy.loginfo("\n--- TEST: Moving with flange facing EYE_POSITION ---")
+    x, y, z = 0.4, 0.3, 0.4
+    success = move_to_xyz_face_eye(
+        move_group, x, y, z, 
+        yaw_step=10.0, 
+        yaw_levels=3, 
+        pitch_step=5.0, 
+        pitch_range=20.0
+    )
     rospy.loginfo(f"移动结果: {'SUCCESS' if success else 'FAIL'}")
     print_current_pose(move_group)
 

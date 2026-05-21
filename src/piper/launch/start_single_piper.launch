@@ -1,6 +1,7 @@
 <launch>
   <arg name="can_port" default="can0" />
   <arg name="auto_enable" default="true" />
+  <arg name="gripper_exist" default="true" />
   <arg name="gripper_val_mutiple" default="1" />
   <!-- <include file="$(find piper_description)/launch/display_xacro.launch"/> -->
   <!-- 启动机械臂节点 -->
@@ -9,7 +10,7 @@
     <param name="auto_enable" value="$(arg auto_enable)" />
     <param name="gripper_val_mutiple" value="$(arg gripper_val_mutiple)" />
     <!-- <param name="rviz_ctrl_flag" value="true" /> -->
-    <param name="gripper_exist" value="true" />
-    <remap from="joint_ctrl_single" to="/joint_states" />
+    <param name="gripper_exist" value="$(arg gripper_exist)" />
+    <remap from="joint_ctrl_single" to="joint_states" />
   </node>
 </launch>

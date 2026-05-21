@@ -1,0 +1,38 @@
+<launch>
+
+  <arg name="arm" default="upper" />
+  <arg name="pipeline" default="ompl" />
+
+  <!-- 加载 robot_description / SRDF / joint_limits / kinematics -->
+  <include file="$(find piper_no_gripper_moveit)/launch/planning_context.launch">
+    <arg name="load_robot_description" value="true" />
+  </include>
+
+  <!-- OMPL 规划管线 -->
+  <group ns="move_group/planning_pipelines">
+    <include file="$(find piper_no_gripper_moveit)/launch/planning_pipeline.launch.xml">
+      <arg name="pipeline" value="ompl" />
+    </include>
+  </group>
+
+  <!-- 发布虚拟 joint_states: move_group 需要当前关节状态才能做 IK -->
+  <node name="joint_state_publisher" pkg="joint_state_publisher" type="joint_state_publisher">
+    <param name="use_gui" value="false" />
+    <param name="rate" value="10" />
+    <rosparam param="source_list">[]</rosparam>
+  </node>
+
+  <!-- move_group 核心节点 (不需要 trajectory_execution / sensor) -->
+  <node name="move_group" pkg="moveit_ros_move_group" type="move_group" respawn="false" output="screen">
+    <param name="allow_trajectory_execution" value="false" />
+    <param name="default_planning_pipeline" value="$(arg pipeline)" />
+    <param name="monitor_dynamics" value="false" />
+  </node>
+
+  <!-- 工作空间分析器 (等待 move_group 就绪后启动) -->
+  <node name="workspace_analyzer" pkg="moveit_ctrl" type="workspace_analyzer.py"
+        output="screen" launch-prefix="python3">
+    <param name="arm" value="$(arg arm)" />
+  </node>
+
+</launch>

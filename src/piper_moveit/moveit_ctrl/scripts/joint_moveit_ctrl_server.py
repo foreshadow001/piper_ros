@@ -3,6 +3,7 @@
 import rospy
 from moveit_commander import *
 from moveit_ctrl.srv import JointMoveitCtrl, JointMoveitCtrlResponse
+from std_srvs.srv import SetBool
 from geometry_msgs.msg import Pose
 from tf.transformations import quaternion_from_euler
 
@@ -24,16 +25,26 @@ class JointMoveitCtrlServer:
         self.gripper_move_group = None
         self.piper_move_group = None
 
+        # 规划超时: 缩短默认 5s 以加速姿态搜索失败时的回退
+        planning_time = rospy.get_param("~planning_time", 0.5)
+        planning_attempts = rospy.get_param("~planning_attempts", 1)
+
         if "arm" in available_groups:
             self.arm_move_group = MoveGroupCommander("arm")
-            rospy.loginfo("Initialized arm move group.")
-        
+            self.arm_move_group.set_planning_time(planning_time)
+            self.arm_move_group.set_num_planning_attempts(planning_attempts)
+            rospy.loginfo(f"Initialized arm move group (planning_time={planning_time}s, attempts={planning_attempts}).")
+
         if "gripper" in available_groups:
             self.gripper_move_group = MoveGroupCommander("gripper")
+            self.gripper_move_group.set_planning_time(planning_time)
+            self.gripper_move_group.set_num_planning_attempts(planning_attempts)
             rospy.loginfo("Initialized gripper move group.")
-        
+
         if "piper" in available_groups:
             self.piper_move_group = MoveGroupCommander("piper")
+            self.piper_move_group.set_planning_time(planning_time)
+            self.piper_move_group.set_num_planning_attempts(planning_attempts)
             rospy.loginfo("Initialized piper move group.")
 
         # 创建关节运动控制服务
@@ -42,13 +53,52 @@ class JointMoveitCtrlServer:
         self.piper_srv = rospy.Service('joint_moveit_ctrl_piper', JointMoveitCtrl, self.handle_joint_moveit_ctrl_piper)
         self.endpose_srv = rospy.Service('joint_moveit_ctrl_endpose', JointMoveitCtrl, self.handle_joint_moveit_ctrl_endpose)
 
+        # 驱动节点 block_arm 服务代理 (阻止 CAN 指令发送，避免假控制器持续占线)
+        self._block_srv = None
+        try:
+            rospy.wait_for_service('block_arm', timeout=3.0)
+            self._block_srv = rospy.ServiceProxy('block_arm', SetBool)
+            rospy.loginfo("Connected to /block_arm service.")
+        except rospy.ROSException:
+            rospy.logwarn("/block_arm service not available — arm will hold position after each move.")
+
         rospy.loginfo("Joint MoveIt Control Services Ready.")
+
+    def _apply_planning_params(self, move_group, request):
+        """应用规划超时。优先使用请求中的 planning_time (需 catkin_make 后生效)。"""
+        planning_time = (request.planning_time
+                         if hasattr(request, 'planning_time') and request.planning_time > 0
+                         else rospy.get_param("~planning_time", 0.5))
+        planning_attempts = rospy.get_param("~planning_attempts", 1)
+        move_group.set_planning_time(planning_time)
+        move_group.set_num_planning_attempts(planning_attempts)
+
+    def _begin_move(self, move_group):
+        """解除 block → 同步假控制器当前位姿，消除上次目标的残留。"""
+        if self._block_srv is not None:
+            try:
+                self._block_srv(SetBool._request_class(data=False))
+            except rospy.ServiceException:
+                pass
+            current_joints = move_group.get_current_joint_values()
+            move_group.set_joint_value_target(current_joints)
+            move_group.go(wait=True)
+
+    def _end_move(self):
+        """恢复 block，阻止假控制器残留位姿下发到驱动。"""
+        if self._block_srv is not None:
+            try:
+                self._block_srv(SetBool._request_class(data=True))
+            except rospy.ServiceException:
+                pass
 
     def handle_joint_moveit_ctrl_arm(self, request):
         rospy.loginfo("Received arm joint movement request.")
 
         try:
             if self.arm_move_group:
+                self._apply_planning_params(self.arm_move_group, request)
+                self._begin_move(self.arm_move_group)
                 arm_joint_goal = request.joint_states[:6]
                 self.arm_move_group.set_joint_value_target(arm_joint_goal)
                 max_velocity = max(1e-6, min(1-1e-6, request.max_velocity))
@@ -57,6 +107,7 @@ class JointMoveitCtrlServer:
                 self.arm_move_group.set_max_acceleration_scaling_factor(max_acceleration)
                 rospy.loginfo(f"max_velocity: {max_velocity} max_acceleration: {max_acceleration}")
                 self.arm_move_group.go(wait=True)
+                self._end_move()
                 rospy.loginfo("Arm movement executed successfully.")
             else:
                 rospy.logerr("Arm move group is not initialized.")
@@ -70,9 +121,11 @@ class JointMoveitCtrlServer:
 
         try:
             if self.gripper_move_group:
+                self._begin_move(self.gripper_move_group)
                 gripper_goal = [request.gripper]
                 self.gripper_move_group.set_joint_value_target(gripper_goal)
                 self.gripper_move_group.go(wait=True)
+                self._end_move()
                 rospy.loginfo("Gripper movement executed successfully.")
             else:
                 rospy.logerr("Gripper move group is not initialized.")
@@ -86,6 +139,8 @@ class JointMoveitCtrlServer:
 
         try:
             if self.piper_move_group:
+                self._apply_planning_params(self.piper_move_group, request)
+                self._begin_move(self.piper_move_group)
                 piper_joint_goal = list(request.joint_states[:6]) + [request.gripper]
                 self.piper_move_group.set_joint_value_target(piper_joint_goal)
                 max_velocity = max(1e-6, min(1-1e-6, request.max_velocity))
@@ -94,6 +149,7 @@ class JointMoveitCtrlServer:
                 self.piper_move_group.set_max_acceleration_scaling_factor(max_acceleration)
                 rospy.loginfo(f"max_velocity: {max_velocity} max_acceleration: {max_acceleration}")
                 self.piper_move_group.go(wait=True)
+                self._end_move()
                 rospy.loginfo("Piper movement executed successfully.")
             else:
                 rospy.logerr("Piper move group is not initialized.")
@@ -107,6 +163,8 @@ class JointMoveitCtrlServer:
 
         try:
             if self.arm_move_group:
+                self._apply_planning_params(self.arm_move_group, request)
+                self._begin_move(self.arm_move_group)
                 position = request.joint_endpose[:3]
                 if len(request.joint_endpose) == 7:
                     # 四元数 [qx, qy, qz, qw]
@@ -115,7 +173,7 @@ class JointMoveitCtrlServer:
                 else:
                     rospy.logerr("Invalid joint_endpose size. It must be 7 (Quaternion).")
                     return JointMoveitCtrlResponse(status=False, error_code=1)
-                
+
                 target_pose = Pose()
                 target_pose.position.x = position[0]
                 target_pose.position.y = position[1]
@@ -132,6 +190,7 @@ class JointMoveitCtrlServer:
                 self.arm_move_group.set_max_acceleration_scaling_factor(max_acceleration)
                 rospy.loginfo(f"max_velocity: {max_velocity} max_acceleration: {max_acceleration}")
                 self.arm_move_group.go(wait=True)
+                self._end_move()
                 rospy.loginfo("Endpose movement executed successfully.")
             else:
                 rospy.logerr("Arm move group is not initialized.")

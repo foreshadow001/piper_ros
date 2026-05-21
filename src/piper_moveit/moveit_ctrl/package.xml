@@ -29,9 +29,13 @@
   <exec_depend>moveit_commander</exec_depend>
   <exec_depend>roscpp</exec_depend>
   <exec_depend>moveit_ros_planning_interface</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>  <!-- 添加 sensor_msgs 作为执行依赖 -->
+  <exec_depend>moveit_ros_move_group</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>message_runtime</exec_depend>
   <exec_depend>rospy</exec_depend>
+  <exec_depend>piper_description</exec_depend>
+  <exec_depend>piper_no_gripper_moveit</exec_depend>
+  <exec_depend>joint_state_publisher</exec_depend>
 
   <!-- Testing dependencies (if needed) -->
   <!-- <test_depend>gtest</test_depend> -->
