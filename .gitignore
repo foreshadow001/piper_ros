@@ -15,3 +15,5 @@ oculus_reader
 __pycache__
 CATKIN_IGNORE
 log
+
+/.claude/
