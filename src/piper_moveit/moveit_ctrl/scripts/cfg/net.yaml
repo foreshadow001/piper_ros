@@ -1,0 +1,6 @@
+# Network configuration for Windows ↔ Ubuntu communication
+network:
+  ip: "192.168.10.4"         # Ubuntu static IP
+  netmask: "255.255.255.0"
+  windows_ip: "192.168.10.3"
+  port: 49300
