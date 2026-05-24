@@ -109,7 +109,7 @@ class C_PiperRosNode():
         self.piper = C_PiperInterface(can_name=self.can_port)
         self.piper.ConnectPort()
         self.piper.MotionCtrl_2(0x01, 0x01, 30,0)
-        self.block_ctrl_flag = False
+        self.block_ctrl_flag = True   # 启动时阻断: 防止假控制器默认位姿驱动机械臂
         # 启动订阅线程
         sub_pos_th = threading.Thread(target=self.SubPosThread)
         sub_pos_th.daemon = True

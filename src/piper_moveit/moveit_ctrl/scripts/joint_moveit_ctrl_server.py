@@ -58,7 +58,9 @@ class JointMoveitCtrlServer:
         try:
             rospy.wait_for_service('block_arm', timeout=3.0)
             self._block_srv = rospy.ServiceProxy('block_arm', SetBool)
-            rospy.loginfo("Connected to /block_arm service.")
+            # 启动时立即阻断: 防止假控制器的默认位姿驱动机械臂自行运动
+            self._block_srv(SetBool._request_class(data=True))
+            rospy.loginfo("Connected to /block_arm service — arm blocked by default.")
         except rospy.ROSException:
             rospy.logwarn("/block_arm service not available — arm will hold position after each move.")
 
