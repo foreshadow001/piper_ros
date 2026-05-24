@@ -73,11 +73,6 @@ class ArmPoseCache:
     def _callback(self, msg):
         with self._lock:
             self._pose = msg.pose
-            self._cb_count = getattr(self, '_cb_count', 0) + 1
-            if self._cb_count <= 3 or self._cb_count % 100 == 0:
-                rospy.loginfo(f"[{self.arm_name}] pose #{self._cb_count}: "
-                              f"pos=({msg.pose.position.x:.4f},{msg.pose.position.y:.4f},{msg.pose.position.z:.4f}) "
-                              f"ori=({msg.pose.orientation.x:.3f},{msg.pose.orientation.y:.3f},{msg.pose.orientation.z:.3f},{msg.pose.orientation.w:.3f})")
 
     @property
     def pose(self):
@@ -163,22 +158,14 @@ class PoseServer:
 
     def _process(self, cmd):
         """Parse a request and return a response string (or None)."""
-        rospy.loginfo(f"[Server] Received: {repr(cmd)}")
         if not cmd.startswith("GET_POSE:"):
             return f"ERROR:unknown command: {cmd}"
         arm_name = cmd.split(":", 1)[1].strip()
         if arm_name not in self._caches:
             return f"ERROR:unknown arm: {arm_name}"
-        cache = self._caches[arm_name]
-        pose = cache.pose
-        rospy.loginfo(f"[Server] {arm_name} pose cached={pose is not None}")
-        if pose is not None:
-            rospy.loginfo(f"[Server] {arm_name} sending: "
-                          f"pos=({pose.position.x:.4f},{pose.position.y:.4f},{pose.position.z:.4f})")
-        resp = cache.format_response()
+        resp = self._caches[arm_name].format_response()
         if resp is None:
             return f"ERROR:no pose data for {arm_name}"
-        rospy.loginfo(f"[Server] Response: {resp[:120]}...")
         return resp
 
     def stop(self):
