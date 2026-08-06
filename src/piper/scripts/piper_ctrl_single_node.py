@@ -126,18 +126,47 @@ class C_PiperRosNode():
     def GetEnableFlag(self):
         return self.__enable_flag
 
+    def _check_can_alive(self):
+        """检查 CAN 接口是否存活。返回 True/False。"""
+        operstate_path = f"/sys/class/net/{self.can_port}/operstate"
+        try:
+            with open(operstate_path, 'r') as f:
+                return f.read().strip() == 'up'
+        except (IOError, OSError):
+            return False
+
     def Pubilsh(self):
         """机械臂消息发布
         """
         rate = rospy.Rate(200)  # 200 Hz
         enable_flag = False
-        # 设置超时时间（秒）
         timeout = 5
-        # 记录进入循环前的时间
         start_time = time.time()
         elapsed_time_flag = False
+
+        can_check_interval = 10  # 每 50ms 检查一次 CAN 存活
+        can_check_counter = 0
+        can_alive = True
+        can_dead_logged = False
+
         while not rospy.is_shutdown():
-            # print(self.piper.GetArmLowSpdInfoMsgs().motor_1.foc_status.driver_enable_status)
+            # 定期检查 CAN 接口存活
+            can_check_counter += 1
+            if can_check_counter >= can_check_interval:
+                can_check_counter = 0
+                can_alive = self._check_can_alive()
+                if not can_alive and not can_dead_logged:
+                    rospy.logerr(f"CAN 接口 {self.can_port} 已断开! "
+                                 "机械臂位姿将不再更新。请检查 USB/CAN 连接。")
+                    can_dead_logged = True
+                elif can_alive and can_dead_logged:
+                    rospy.loginfo(f"CAN 接口 {self.can_port} 已恢复。")
+                    can_dead_logged = False
+
+            if not can_alive:
+                rate.sleep()
+                continue
+
             if(self.auto_enable):
                 while not (enable_flag):
                     elapsed_time = time.time() - start_time

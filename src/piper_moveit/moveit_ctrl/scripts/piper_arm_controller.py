@@ -862,11 +862,11 @@ if __name__ == "__main__":
 
     # 回零
     ctrl.move_to_joints([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    rospy.sleep(2)
+    rospy.sleep(0.5)
     ctrl.print_current_pose()
 
     # 法兰盘对眼位移动 (safety_bbox 内)
-    ctrl.move_to(0.4, 0.0, 0.3)
+    ctrl.move_to(0.3, 0.0, 0.1)
     rospy.sleep(1)
     ctrl.print_current_pose()
 
