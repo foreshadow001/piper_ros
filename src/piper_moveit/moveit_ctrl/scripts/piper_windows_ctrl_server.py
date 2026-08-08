@@ -69,11 +69,10 @@ def _zxz_from_quaternion(qx, qy, qz, qw):
 class PiperCtrlServer:
     """Single-threaded TCP server. Handles one client at a time."""
 
-    def __init__(self, host, port, ctrl, can_port):
+    def __init__(self, host, port, ctrls):
         self._host = host
         self._port = port
-        self._ctrl = ctrl          # PiperArmController
-        self._can_port = can_port  # e.g. "piper_upper"
+        self._ctrls = ctrls  # dict: arm_name → PiperArmController
         self._sock = None
         self._running = False
         self._thread = None
@@ -87,7 +86,8 @@ class PiperCtrlServer:
         self._running = True
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
-        rospy.loginfo(f"PiperCtrlServer listening on {self._host}:{self._port} (arm={self._can_port})")
+        rospy.loginfo(f"PiperCtrlServer listening on {self._host}:{self._port} "
+                      f"(arms={list(self._ctrls.keys())})")
 
     def _serve(self):
         while self._running and not rospy.is_shutdown():
@@ -139,9 +139,9 @@ class PiperCtrlServer:
     # Command processing
     # ------------------------------------------------------------------
 
-    def _get_current_flange_pose(self):
+    def _get_current_flange_pose(self, can_port):
         """Query /end_pose topic for current flange pose. Returns (x,y,z,qx,qy,qz,qw) or None."""
-        topic = f"{self._can_port}/end_pose" if self._can_port else "end_pose"
+        topic = f"{can_port}/end_pose" if can_port else "end_pose"
         try:
             msg = rospy.wait_for_message(topic, PoseStamped, timeout=1.0)
             p = msg.pose
@@ -151,9 +151,9 @@ class PiperCtrlServer:
             rospy.logwarn(f"Timeout waiting for {topic}")
             return None
 
-    def _format_moved_response(self, arm):
+    def _format_moved_response(self, arm, can_port):
         """Query current pose and format MOVED:... response."""
-        pose = self._get_current_flange_pose()
+        pose = self._get_current_flange_pose(can_port)
         if pose is None:
             return f"ERROR:{arm}:no pose data"
         x, y, z, qx, qy, qz, qw = pose
@@ -168,28 +168,34 @@ class PiperCtrlServer:
         if cmd.startswith("MOVE_JOINTS:"):
             # "MOVE_JOINTS:upper:0.0,0.0,0.0,0.0,0.0,0.0"
             _, arm, joints_str = cmd.split(":", 2)
+            if arm not in self._ctrls:
+                return f"ERROR:{arm}:unknown arm (available: {list(self._ctrls.keys())})"
+            ctrl = self._ctrls[arm]
             joints = [float(x.strip()) for x in joints_str.split(",")]
             if len(joints) != 6:
                 return f"ERROR:{arm}:expected 6 joint values, got {len(joints)}"
             rospy.loginfo(f"MOVE_JOINTS {arm}: {joints}")
-            ok = self._ctrl.move_to_joints(joints)
+            ok = ctrl.move_to_joints(joints)
             if ok:
-                rospy.sleep(0.15)  # wait for /end_pose update
-                return self._format_moved_response(arm)
+                rospy.sleep(0.15)
+                return self._format_moved_response(arm, ctrl.can_port)
             return f"ERROR:{arm}:move_joints failed"
 
         elif cmd.startswith("MOVE_TO:"):
             # "MOVE_TO:upper:0.3,0.1,0.2"
             _, arm, xyz_str = cmd.split(":", 2)
+            if arm not in self._ctrls:
+                return f"ERROR:{arm}:unknown arm (available: {list(self._ctrls.keys())})"
+            ctrl = self._ctrls[arm]
             xyz = [float(v.strip()) for v in xyz_str.split(",")]
             if len(xyz) != 3:
                 return f"ERROR:{arm}:expected 3 values (x,y,z), got {len(xyz)}"
             x, y, z = xyz
             rospy.loginfo(f"MOVE_TO {arm}: ({x:.3f}, {y:.3f}, {z:.3f})")
-            ok = self._ctrl.move_to(x, y, z)
+            ok = ctrl.move_to(x, y, z)
             if ok:
-                rospy.sleep(0.15)  # wait for /end_pose update
-                return self._format_moved_response(arm)
+                rospy.sleep(0.15)
+                return self._format_moved_response(arm, ctrl.can_port)
             return f"ERROR:{arm}:no_solution"
 
         elif cmd.strip() == "SHUTDOWN":
@@ -226,15 +232,16 @@ def main():
     host = net["ip"]
     ctrl_port = net.get("ctrl_port", 49301)
 
-    # Create controller (upper arm, service mode)
-    rospy.loginfo("Initializing PiperArmController for upper arm...")
-    ctrl = PiperArmController.from_yaml("upper", use_service=True)
-    can_port = ctrl.can_port  # e.g. "piper_upper"
+    # Create controllers for both arms (service mode)
+    ctrls = {}
+    for arm_name in ("upper", "lower"):
+        rospy.loginfo(f"Initializing PiperArmController for {arm_name} arm...")
+        ctrl = PiperArmController.from_yaml(arm_name, use_service=True)
+        ctrls[arm_name] = ctrl
+        rospy.loginfo(f"  {arm_name}: can_port={ctrl.can_port}, "
+                      f"eye_position={ctrl.eye_position}")
 
-    rospy.loginfo(f"PiperArmController ready: can_port={can_port}, "
-                  f"eye_position={ctrl.eye_position}")
-
-    server = PiperCtrlServer(host, ctrl_port, ctrl, can_port)
+    server = PiperCtrlServer(host, ctrl_port, ctrls)
     server.start()
 
     rospy.loginfo(f"piper_windows_ctrl_server ready on {host}:{ctrl_port}. "
