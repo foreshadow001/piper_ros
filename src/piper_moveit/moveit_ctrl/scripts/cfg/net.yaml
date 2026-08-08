@@ -3,4 +3,5 @@ network:
   ip: "192.168.10.4"         # Ubuntu static IP
   netmask: "255.255.255.0"
   windows_ip: "192.168.10.3"
-  port: 49300
+  port: 49300                # windows_end_monitor.py
+  ctrl_port: 49301           # piper_windows_ctrl_server.py
