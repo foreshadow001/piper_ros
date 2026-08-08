@@ -866,7 +866,7 @@ if __name__ == "__main__":
     ctrl.print_current_pose()
 
     # 法兰盘对眼位移动 (safety_bbox 内)
-    ctrl.move_to(0.3, 0.0, 0.1)
+    ctrl.move_to(0.3, 0.0, 0.2)
     rospy.sleep(1)
     ctrl.print_current_pose()
 
