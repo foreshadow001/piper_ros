@@ -176,9 +176,16 @@ class PiperCtrlServer:
                 return f"ERROR:{arm}:expected 6 joint values, got {len(joints)}"
             rospy.loginfo(f"MOVE_JOINTS {arm}: {joints}")
             ok = ctrl.move_to_joints(joints)
+            rospy.sleep(0.15)
             if ok:
-                rospy.sleep(0.15)
                 return self._format_moved_response(arm, ctrl.can_port)
+            # move_to_joints may return False if arm is already at target
+            # (MoveIt planner finds no path when start == goal).
+            # Query current pose — if valid, the arm is effectively zeroed.
+            resp = self._format_moved_response(arm, ctrl.can_port)
+            if resp and not resp.startswith("ERROR:"):
+                rospy.loginfo(f"MOVE_JOINTS {arm}: arm already at target, reporting current pose")
+                return resp
             return f"ERROR:{arm}:move_joints failed"
 
         elif cmd.startswith("MOVE_TO:"):
