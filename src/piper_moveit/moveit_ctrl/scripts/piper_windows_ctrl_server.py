@@ -3,8 +3,10 @@
 
 Listens for TCP connections from the Windows host. Supported commands:
 
+    READY                                                   # handshake → ACK
     MOVE_JOINTS:<arm>:<j1>,<j2>,<j3>,<j4>,<j5>,<j6>     # joint-space move (rad)
     MOVE_TO:<arm>:<x>,<y>,<z>                              # Cartesian move (m)
+    GET_POSE:<arm>                                          # query current flange pose
     SHUTDOWN                                                # exit server
 
 After each movement, queries /<can_port>/end_pose for the actual reached
@@ -165,7 +167,27 @@ class PiperCtrlServer:
 
     def _process(self, cmd):
         """Parse and execute a command. Returns response string or None."""
-        if cmd.startswith("MOVE_JOINTS:"):
+        if cmd.strip() == "READY":
+            # Handshake: client confirms server is ready
+            return "ACK"
+
+        elif cmd.startswith("GET_POSE:"):
+            # "GET_POSE:upper" → query current flange pose (no movement)
+            _, arm = cmd.split(":", 1)
+            if arm not in self._ctrls:
+                return f"ERROR:{arm}:unknown arm (available: {list(self._ctrls.keys())})"
+            ctrl = self._ctrls[arm]
+            pose = self._get_current_flange_pose(ctrl.can_port)
+            if pose is None:
+                return f"ERROR:{arm}:no pose data"
+            x, y, z, qx, qy, qz, qw = pose
+            alpha, beta, gamma = _zxz_from_quaternion(qx, qy, qz, qw)
+            return (f"POSE:{arm}:"
+                    f"{x:.6f},{y:.6f},{z:.6f},"
+                    f"{qx:.6f},{qy:.6f},{qz:.6f},{qw:.6f},"
+                    f"{alpha:.4f},{beta:.4f},{gamma:.4f}")
+
+        elif cmd.startswith("MOVE_JOINTS:"):
             # "MOVE_JOINTS:upper:0.0,0.0,0.0,0.0,0.0,0.0"
             _, arm, joints_str = cmd.split(":", 2)
             if arm not in self._ctrls:
