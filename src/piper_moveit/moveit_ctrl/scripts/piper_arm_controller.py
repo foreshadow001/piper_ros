@@ -514,8 +514,9 @@ class PiperArmController:
                 parts.append(f"{axis}{lo}_{hi}")
         if self.obstacles:
             parts.append(f"n{len(self.obstacles)}")
-            for obs in self.obstacles:
-                parts.append(obs['name'])
+            for i, obs in enumerate(self.obstacles):
+                if i <= 2:
+                    parts.append(obs['name'])
         return '_'.join(parts)
 
     # ------------------------------------------------------------------
