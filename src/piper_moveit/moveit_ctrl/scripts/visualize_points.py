@@ -190,6 +190,10 @@ def main():
             resolved_file = _select_file(files)
             if resolved_file is None:
                 sys.exit(0)
+                
+        file_path = Path(resolved_file)
+        file_name = file_path.name
+        can_port = f"{file_name.split('_')[1]}_{file_name.split('_')[2]}"
 
     else:
         # 先检查是否为直接文件路径

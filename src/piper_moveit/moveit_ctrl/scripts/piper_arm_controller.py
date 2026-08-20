@@ -483,13 +483,17 @@ class PiperArmController:
         rospy.loginfo("障碍物已添加。")
 
     def _remove_obstacles(self):
-        if not self.obstacles:
-            return
+        # 基于场景实际状态清理而非当前配置列表:
+        # 历史运行遗留的对象 (配置已改名/删除的障碍物) 也必须移除
         if self.scene is None:
             return
-        for obs in self.obstacles:
-            name = obs.get('name', '')
-            if name:
+        try:
+            known = self.scene.get_known_object_names()
+        except Exception:
+            return
+        wall_set = set(self._wall_names)
+        for name in known:
+            if name and name not in wall_set:
                 self.scene.remove_world_object(name)
 
     def clear_obstacles(self):
