@@ -48,6 +48,7 @@ class WorkspaceAnalyzer:
         self.sampling_box = sampling_box
         self.resolution = resolution
         self.reachable_points = []
+        self.offset_records = []      # (x, y, z, d_alpha, d_beta) — fast_solve 数据
 
         self.keep_running = True
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -59,8 +60,10 @@ class WorkspaceAnalyzer:
         config_label = self.controller.get_config_label()
         if label:
             self.output_file = os.path.join(OUTPUT_DIR, f"points_{label}_{config_label}.txt")
+            self.offset_output_file = os.path.join(OUTPUT_DIR, f"offsets_{label}_{config_label}.txt")
         else:
             self.output_file = os.path.join(OUTPUT_DIR, f"points_{config_label}.txt")
+            self.offset_output_file = os.path.join(OUTPUT_DIR, f"offsets_{config_label}.txt")
 
         rospy.loginfo(f"WorkspaceAnalyzer 已初始化: sampling={sampling_box}, "
                       f"safety_bbox={controller.safety_bbox}, obstacles={len(controller.obstacles)}, "
@@ -92,40 +95,33 @@ class WorkspaceAnalyzer:
 
     def check_reachability(self, x, y, z):
         if not self.is_geometrically_safe(x, y, z):
-            return False
+            return None
 
-        # α 使法兰盘 Z 轴大致指向目标在 XY 平面的投影方向
-        auto_alpha_deg = math.degrees(math.atan2(x, -y))
-        if not (0.0 <= auto_alpha_deg <= 180.0):
-            return False
+        ctrl = self.controller
+        x, y, z = float(x), float(y), float(z)
 
-        beta_candidates = [90.0, 45.0, 0.0]
-
-        for beta in beta_candidates:
-            if rospy.is_shutdown() or not self.keep_running:
-                return False
-
-            q = self._quaternion_from_zxz(auto_alpha_deg, beta, 0.0)
-
+        def _try_plan_only(alpha, beta):
+            """plan-only 后端: 与实测 move_to 同一搜索循环，仅规划不执行。"""
+            q = ctrl._quaternion_from_zxz(alpha, beta, 0.0)
             target_pose = Pose()
-            target_pose.position.x = x
-            target_pose.position.y = y
+            target_pose.position.x, target_pose.position.y = x, y
             target_pose.position.z = z
-            target_pose.orientation.x = q[0]
-            target_pose.orientation.y = q[1]
-            target_pose.orientation.z = q[2]
-            target_pose.orientation.w = q[3]
+            target_pose.orientation.x, target_pose.orientation.y = q[0], q[1]
+            target_pose.orientation.z, target_pose.orientation.w = q[2], q[3]
 
             self.move_group.set_pose_target(target_pose)
             result = self.move_group.plan()
             is_success = result[0] if isinstance(result, tuple) else result
+            return bool(is_success)
 
-            if is_success:
-                self.move_group.clear_pose_targets()
-                return True
-
-        self.move_group.clear_pose_targets()
-        return False
+        # 与实测完全一致的搜索 (同一函数、同一候选序、同一中止语义)
+        result = ctrl.search_orientation(
+            x, y, z, _try_plan_only,
+            abort_check=lambda: not self.keep_running)
+        if result is None:
+            return None
+        _, _, da, db, _dist = result
+        return (da, db)
 
     def analyze(self):
         try:
@@ -145,8 +141,10 @@ class WorkspaceAnalyzer:
                                 rospy.logwarn("Analysis interrupted by user.")
                                 return
 
-                            if self.check_reachability(x, y, z):
+                            offsets = self.check_reachability(x, y, z)
+                            if offsets is not None:
                                 self.reachable_points.append((x, y, z))
+                                self.offset_records.append((x, y, z, *offsets))
                             pbar.update(1)
 
         except KeyboardInterrupt:
@@ -161,6 +159,10 @@ class WorkspaceAnalyzer:
             for p in self.reachable_points:
                 f.write(f"{p[0]:.3f} {p[1]:.3f} {p[2]:.3f}\n")
         rospy.loginfo(f"Saved {len(self.reachable_points)} points to {self.output_file}")
+
+        from fast_solve import save_offsets
+        save_offsets(self.offset_output_file, self.offset_records)
+        rospy.loginfo(f"Saved {len(self.offset_records)} offset records to {self.offset_output_file}")
 
 
 if __name__ == '__main__':

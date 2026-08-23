@@ -261,11 +261,17 @@ def main():
     host = net["ip"]
     ctrl_port = net.get("ctrl_port", 49301)
 
-    # Create controllers for both arms (service mode)
+    # Create controllers for both arms (service mode)。
+    # PlanningScene 初始化失败时直接退出 — 无碰撞约束的遥操作不允许启动。
     ctrls = {}
     for arm_name in ("upper", "lower"):
         rospy.loginfo(f"Initializing PiperArmController for {arm_name} arm...")
-        ctrl = PiperArmController.from_yaml(arm_name, use_service=True)
+        try:
+            ctrl = PiperArmController.from_yaml(arm_name, use_service=True)
+        except RuntimeError as e:
+            rospy.logerr(f"{arm_name} controller init failed: {e}")
+            rospy.signal_shutdown("safety scene unavailable")
+            return
         ctrls[arm_name] = ctrl
         rospy.loginfo(f"  {arm_name}: can_port={ctrl.can_port}, "
                       f"eye_position={ctrl.eye_position}")
