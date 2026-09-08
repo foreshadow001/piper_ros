@@ -4,7 +4,7 @@
 arm:
   group: "arm"
   can_port: "piper_lower"
-  eye_position: [1.10, 0.00, 0.55]   # 人眼/相机在基座坐标系中的位置 (x, y, z) 米
+  eye_position: [0.85, 0.00, 0.50]   # 人眼/相机在基座坐标系中的位置 (x, y, z) 米
   planning_timeout: 0.05
   hard_timeout: 0.05
   yaw_step: 10.0
