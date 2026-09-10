@@ -7,23 +7,25 @@ arm:
   eye_position: [0.85, 0.00, -0.10]   # 人眼/相机在基座坐标系中的位置 (x, y, z) 米
   planning_timeout: 0.05
   hard_timeout: 0.05
-  yaw_step: 10.0
-  yaw_levels: 3
-  pitch_step: 5.0
-  pitch_range: 20.0
+  search_radius: 30.0    # 圆盘搜索域半径 (度) — 总指向偏离上限
+  search_step: 10.0      # Δα/Δβ 网格间距 (度)
 
 safety_bbox:
   x: [-0.4, 0.7]
   y: [-0.4, 0.4]
-  z: [0.0, 0.50]
+  z: [-0.2, 0.7]
 
 obstacles:
   - name: "cams"
     x: [0.08, 0.25]
     y: [-0.30, 0.30]
     z: [0.00, 0.12]
+  - name: "bottom_panel"
+    x: [-0.40, 0.25]
+    y: [-0.30, 0.30]
+    z: [-0.20, 0.00]
   - name: "upper_pillar"
-    x: [-0.40, 0.00]
+    x: [-0.40, 0.10]
     y: [-0.15, 0.15]
     z: [0.47, 0.50]
   - name: "left_pillar"
@@ -45,10 +47,16 @@ obstacles:
 
 workspace_analysis:
   sampling_box:
-    x: [0.0, 0.7]
+    x: [-0.1, 0.7]
     y: [-0.3, 0.3]
-    z: [0.1, 0.5]
+    z: [-0.1, 0.6]
   resolution: 0.05
+  # 采样排除区域: 落入的采样点直接跳过 (格式与 obstacles 相同)
+  exclude_zones:
+    - name: "lower_workspace"
+      x: [-0.40, 0.25]
+      y: [-0.30, 0.30]
+      z: [0.0, 0.15]
 
 # 末端工具相对于法兰盘的偏置 (先旋转 Z-X-Z', 再平移)
 # 末端工具相对于法兰盘的偏置 (先旋转 Z-X-Z', 再平移)

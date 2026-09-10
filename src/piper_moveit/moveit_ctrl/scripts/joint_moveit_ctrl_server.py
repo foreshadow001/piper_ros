@@ -5,12 +5,22 @@ from moveit_commander import *
 from moveit_ctrl.srv import JointMoveitCtrl, JointMoveitCtrlResponse
 from std_srvs.srv import SetBool
 from geometry_msgs.msg import Pose
+from sensor_msgs.msg import JointState
 from tf.transformations import quaternion_from_euler
 
 class JointMoveitCtrlServer:
     def __init__(self):
         # 初始化 ROS 节点
         rospy.init_node('joint_moveit_ctrl_server')
+
+        # 关节状态频率守卫: CAN 断开后驱动仍低频发布冻结数据
+        # (话题不死、stamp 照填), 必须按窗口频率检测。
+        self._js_count = 0
+        self._js_window_count = 0
+        self._js_window_t0 = rospy.Time.now().to_sec()
+        self._js_topic = rospy.resolve_name('joint_states_actual')
+        self._js_sub = rospy.Subscriber(
+            self._js_topic, JointState, self._js_cb, queue_size=1)
 
         # 初始化 MoveIt
         roscpp_initialize([])
@@ -66,6 +76,38 @@ class JointMoveitCtrlServer:
 
         rospy.loginfo("Joint MoveIt Control Services Ready.")
 
+    def _js_cb(self, msg):
+        self._js_count += 1
+
+    def _joint_states_fresh(self, window=1.0, min_rate=10.0):
+        """关节状态发布频率 ≥ min_rate → True。
+
+        注: 不能用 header.stamp 判新鲜 — CAN 断开后驱动仍低频发布,
+        stamp 填的是发送时刻 (内容是冻结的旧关节值), 时间戳是"新"的。
+        必须按窗口内计数测频率 (正常 ~100Hz, 断链后 <1Hz)。
+        """
+        now = rospy.Time.now().to_sec()
+        # 窗口滚动: 每过 window 秒重置计数
+        if now - self._js_window_t0 >= window:
+            self._js_window_count = self._js_count
+            self._js_window_t0 = now
+            self._js_count = 0
+        rate = self._js_count / max(1e-6, now - self._js_window_t0)
+        return rate >= min_rate
+
+    def _guard_joint_states(self, arm_label):
+        """运动前守卫: 关节状态频率异常时拒绝执行并返回失败。
+
+        避免假执行 — CAN 断开后 move_group 对冻结的 fake controller
+        规划+回灌照常返回成功, 真臂却没动, 客户端完全无感知。
+        """
+        if not self._joint_states_fresh():
+            rospy.logerr(
+                f"{arm_label} 拒绝执行: 关节状态话题频率异常 "
+                f"(/{self._js_topic}, 低于 10Hz) — CAN 断开或驱动停止?")
+            return False
+        return True
+
     def _apply_planning_params(self, move_group, request):
         """应用规划超时。优先使用请求中的 planning_time (需 catkin_make 后生效)。"""
         planning_time = (request.planning_time
@@ -97,6 +139,8 @@ class JointMoveitCtrlServer:
     def handle_joint_moveit_ctrl_arm(self, request):
         rospy.loginfo("Received arm joint movement request.")
 
+        if not self._guard_joint_states('arm'):
+            return JointMoveitCtrlResponse(status=False, error_code=2)
         try:
             if self.arm_move_group:
                 self._apply_planning_params(self.arm_move_group, request)
@@ -121,6 +165,8 @@ class JointMoveitCtrlServer:
     def handle_joint_moveit_ctrl_gripper(self, request):
         rospy.loginfo("Received gripper joint movement request.")
 
+        if not self._guard_joint_states('gripper'):
+            return JointMoveitCtrlResponse(status=False, error_code=2)
         try:
             if self.gripper_move_group:
                 self._begin_move(self.gripper_move_group)
@@ -139,6 +185,8 @@ class JointMoveitCtrlServer:
     def handle_joint_moveit_ctrl_piper(self, request):
         rospy.loginfo("Received piper joint movement request.")
 
+        if not self._guard_joint_states('piper'):
+            return JointMoveitCtrlResponse(status=False, error_code=2)
         try:
             if self.piper_move_group:
                 self._apply_planning_params(self.piper_move_group, request)
@@ -163,6 +211,8 @@ class JointMoveitCtrlServer:
     def handle_joint_moveit_ctrl_endpose(self, request):
         rospy.loginfo("Received endpose movement request.")
 
+        if not self._guard_joint_states('endpose'):
+            return JointMoveitCtrlResponse(status=False, error_code=2)
         try:
             if self.arm_move_group:
                 self._apply_planning_params(self.arm_move_group, request)

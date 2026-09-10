@@ -10,6 +10,7 @@ if os.path.exists(_CONFIG) and 'ROSCONSOLE_CONFIG_FILE' not in os.environ:
     os.environ['ROSCONSOLE_CONFIG_FILE'] = _CONFIG
 
 import sys
+import time
 import yaml
 import rospy
 import math
@@ -34,12 +35,18 @@ OUTPUT_DIR = _SCRIPT_DIR / "reachable_range"
 class WorkspaceAnalyzer:
     """对采样空间进行 IK 可达性分析，结果保存到 reachable_range/ 目录。"""
 
-    def __init__(self, controller, sampling_box, resolution=0.05, label=None):
+    def __init__(self, controller, sampling_box, resolution=0.05, label=None,
+                 reach_radius=None, exclude_zones=None):
         """
         :param controller: 已配置好的 PiperArmController 实例 (含 safety_bbox / obstacles)
         :param sampling_box: {'x': [min,max], 'y': [min,max], 'z': [min,max]}
         :param resolution: 采样分辨率 (米)
         :param label: 机械臂名称标签 (如 piper_upper)，用于输出文件名前缀
+        :param reach_radius: 球域预筛半径 (米) — 距原点超过此值的采样点直接判不可达,
+            不进规划 (省 ~2s/点)。None = 不启用。应取实测最大可达半径 + 一个网格余量。
+        :param exclude_zones: 采样排除区域列表, YAML 格式与 obstacles 相同
+            (name + x/y/z 区间)。落入任一区域的采样点直接跳过, 不进规划。
+            用于剔除已知不需要工作的空间 (如另一臂的作业区/相机底座区)。
         """
         if not rospy.core.is_initialized():
             rospy.init_node('workspace_analyzer', anonymous=True)
@@ -47,10 +54,13 @@ class WorkspaceAnalyzer:
         self.controller = controller
         self.sampling_box = sampling_box
         self.resolution = resolution
+        self.reach_radius = reach_radius
+        self.exclude_zones = exclude_zones or []
         self.reachable_points = []
         self.offset_records = []      # (x, y, z, d_alpha, d_beta) — fast_solve 数据
 
         self.keep_running = True
+        self._last_point_seconds = 0.0    # 看门狗: 单点耗时 (正常 <5s, 链路故障 ~30s)
         signal.signal(signal.SIGINT, self.signal_handler)
 
         self.move_group = self.controller.move_group
@@ -67,6 +77,7 @@ class WorkspaceAnalyzer:
 
         rospy.loginfo(f"WorkspaceAnalyzer 已初始化: sampling={sampling_box}, "
                       f"safety_bbox={controller.safety_bbox}, obstacles={len(controller.obstacles)}, "
+                      f"reach_radius={reach_radius}, exclude_zones={len(self.exclude_zones)}, "
                       f"output={self.output_file}")
 
     def signal_handler(self, sig, frame):
@@ -82,7 +93,19 @@ class WorkspaceAnalyzer:
         return list(quaternion_multiply(quaternion_multiply(q_z1, q_x), q_z2))
 
     def is_geometrically_safe(self, x, y, z):
+        # 排除区域: 落入任一 exclude_zone 的采样点直接跳过 (不进规划)
+        for zone in self.exclude_zones:
+            if (zone['x'][0] <= x <= zone['x'][1] and
+                    zone['y'][0] <= y <= zone['y'][1] and
+                    zone['z'][0] <= z <= zone['z'][1]):
+                return False
         bbox = self.controller.safety_bbox
+        if bbox is None and self.reach_radius is None:
+            return True
+        # 球域预筛: 超出最大可达半径的点直接判不可达, 不进规划 (省 ~2s/点)
+        if self.reach_radius is not None:
+            if x * x + y * y + z * z > self.reach_radius ** 2:
+                return False
         if bbox is None:
             return True
         for axis, val in (('x', x), ('y', y), ('z', z)):
@@ -96,6 +119,15 @@ class WorkspaceAnalyzer:
     def check_reachability(self, x, y, z):
         if not self.is_geometrically_safe(x, y, z):
             return None
+
+        # 运行中看门狗: 上一点耗时异常 (候选全灭 × CurrentStateMonitor 超时)
+        # 说明关节状态可能已停更 — 单点 > 20s 视为链路故障, 立即中止
+        if self._last_point_seconds > 20.0:
+            raise RuntimeError(
+                f"单点耗时 {self._last_point_seconds:.0f}s — 关节状态话题可能已停更"
+                f" (CAN 断开?)。中止分析, 请检查链路后重跑。"
+                f"已完成的 {len(self.reachable_points)} 点已保存。"
+            )
 
         ctrl = self.controller
         x, y, z = float(x), float(y), float(z)
@@ -141,7 +173,9 @@ class WorkspaceAnalyzer:
                                 rospy.logwarn("Analysis interrupted by user.")
                                 return
 
+                            t0 = time.time()
                             offsets = self.check_reachability(x, y, z)
+                            self._last_point_seconds = time.time() - t0
                             if offsets is not None:
                                 self.reachable_points.append((x, y, z))
                                 self.offset_records.append((x, y, z, *offsets))
@@ -149,6 +183,9 @@ class WorkspaceAnalyzer:
 
         except KeyboardInterrupt:
             rospy.logwarn("Keyboard Interrupt captured.")
+        except RuntimeError as e:
+            # 看门狗触发: 已完成部分在 finally 中保存
+            rospy.logerr(str(e))
 
         finally:
             self.save_results()
@@ -204,5 +241,7 @@ if __name__ == '__main__':
     label = Path(ctrl.yaml_path).stem
     analyzer = WorkspaceAnalyzer(
         ctrl, wa['sampling_box'], wa.get('resolution', 0.05), label=label,
+        reach_radius=wa.get('reach_radius'),
+        exclude_zones=wa.get('exclude_zones'),
     )
     analyzer.analyze()

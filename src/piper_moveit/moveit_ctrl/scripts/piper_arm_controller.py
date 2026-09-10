@@ -134,6 +134,39 @@ def _call_joint_moveit_ctrl_endpose(x, y, z, qx, qy, qz, qw,
     return _call_srv_with_timeout(srv, req)
 
 
+def ensure_joint_states_alive(topic, window=3.0, min_rate=10.0):
+    """启动预检: 关节状态话题必须以正常频率发布。
+
+    CAN 断开后驱动节点仍低频发布冻结数据 (话题不死、header.stamp 照填,
+    内容是旧值) — "有无消息"判不出来, 必须测频率。正常 ~100Hz,
+    断链后骤降 (<1Hz)。move_group 拿冻结状态每次规划仍会静默等 ~1s,
+    29 候选 ≈ 30s/点且无报错 (ROSCONSOLE 抑制还会吞掉警告)。
+
+    :param topic: 关节状态话题名 (如 "piper_lower/joint_states_actual")
+    :param window: 采样窗口 (秒)
+    :param min_rate: 最低可接受频率 (Hz)
+    :raises RuntimeError: 窗口内频率低于 min_rate 或一帧都没有
+    """
+    from sensor_msgs.msg import JointState
+    count = {"n": 0}
+
+    def _cb(_msg):
+        count["n"] += 1
+
+    sub = rospy.Subscriber(topic, JointState, _cb)
+    rospy.sleep(window)
+    sub.unregister()
+    rate = count["n"] / window
+
+    if rate < min_rate:
+        raise RuntimeError(
+            f"关节状态话题 /{topic} 频率 {rate:.1f}Hz < {min_rate:.0f}Hz — "
+            "CAN 可能已断开 (驱动低频发布冻结数据) 或驱动/过滤器未正常工作。\n"
+            f"请检查: CAN 链路 (bash can_activate.sh ...)、"
+            f"rostopic hz /{topic}。move_group 在此状态下每次规划静默等 ~1s。"
+        )
+
+
 # ------------------------------------------------------------------
 # PiperArmController
 # ------------------------------------------------------------------
@@ -158,10 +191,8 @@ class PiperArmController:
         can_port="",
         safety_bbox=None,
         obstacles=None,
-        yaw_step=10.0,
-        yaw_levels=3,
-        pitch_step=5.0,
-        pitch_range=20.0,
+        search_radius=30.0,
+        search_step=10.0,
         planning_timeout=0.05,
         hard_timeout=0.5,
         velocity_scaling=1.0,
@@ -176,10 +207,8 @@ class PiperArmController:
         :param arm_group: MoveIt 规划组名称
         :param safety_bbox: 大空间限制 {'x': [min, max], 'y': [min, max], 'z': [min, max]} 或 None
         :param obstacles: 空间内小障碍物列表
-        :param yaw_step: yaw 搜索步长 (度)
-        :param yaw_levels: yaw 搜索层数
-        :param pitch_step: pitch 搜索步长 (度)
-        :param pitch_range: 理想 yaw 时的 pitch 搜索范围 (度)
+        :param search_radius: 圆盘搜索域半径 (度) — 允许的最大总指向偏离
+        :param search_step: Δα/Δβ 网格间距 (度) — 候选密度
         :param planning_timeout: MoveIt 软超时 (秒)
         :param hard_timeout: 线程级硬超时兜底 (秒)
         :param velocity_scaling: 最大速度比例 (0-1)
@@ -192,10 +221,8 @@ class PiperArmController:
         self.eye_position = eye_position
         self.safety_bbox = safety_bbox
         self.obstacles = obstacles if obstacles is not None else []
-        self.yaw_step = yaw_step
-        self.yaw_levels = yaw_levels
-        self.pitch_step = pitch_step
-        self.pitch_range = pitch_range
+        self.search_radius = search_radius
+        self.search_step = search_step
         self.planning_timeout = planning_timeout
         self.hard_timeout = hard_timeout
         self._use_service = use_service
@@ -364,14 +391,16 @@ class PiperArmController:
             obstacles=obstacles,
             planning_timeout=arm.get('planning_timeout', 0.05),
             hard_timeout=arm.get('hard_timeout', 0.5),
-            yaw_step=arm.get('yaw_step', 10.0),
-            yaw_levels=arm.get('yaw_levels', 3),
-            pitch_step=arm.get('pitch_step', 5.0),
-            pitch_range=arm.get('pitch_range', 20.0),
+            search_radius=arm.get('search_radius', 30.0),
+            search_step=arm.get('search_step', 10.0),
             use_service=use_service,
         )
         instance.workspace_config = cfg.get('workspace_analysis', {})
         instance.yaml_path = str(path)
+        # 启动预检: 关节状态话题必须有数据 (CAN 断开时 move_group 每次规划
+        # 静默等 ~1s 且不报错, 见 ensure_joint_states_alive 文档)
+        js_topic = f"{can_port}/joint_states_actual" if can_port else "joint_states_actual"
+        ensure_joint_states_alive(js_topic)
         # fast_solve: 仅服务模式 (直连/分析模式是偏移数据生产方, 必须纯螺旋)
         if use_service:
             instance._offset_records = instance._load_offset_records(path)
@@ -425,83 +454,88 @@ class PiperArmController:
         beta  = math.degrees(math.atan2(math.sqrt(dx * dx + dy * dy), dz))
         return alpha, beta
 
-    def _compute_beta_for_alpha(self, tx, ty, tz, alpha_deg):
-        """固定 α 下反算使法兰盘 Z 最接近 eye 方向的 β。
-
-        β = atan2(sin(α)dx - cos(α)dy, dz)
-        """
-        ex, ey, ez = self.eye_position
-        dx, dy, dz = ex - tx, ey - ty, ez - tz
-        a = math.radians(alpha_deg)
-        A = math.sin(a) * dx - math.cos(a) * dy
-        return math.degrees(math.atan2(A, dz))
-
     # ------------------------------------------------------------------
     # 统一候选生成与搜索循环 (move_to 两种模式 / workspace_analyzer 共用)
     # ------------------------------------------------------------------
 
     def alpha_beta_candidates(self, x, y, z):
-        """围绕几何理想 (α, β) 螺旋生成候选姿态 (搜索循环的唯一候选源)。
+        """围绕几何理想 (α, β) 的圆盘域候选生成 (搜索循环的唯一候选源)。
 
-        返回 [(alpha, beta, d_alpha, d_beta), ...]:
-        - best-first: 按偏离理想程度升序
-        - 非理想 α 层的 β 搜索范围减半 (与原内联逻辑一致)
-        - d_alpha/d_beta: 相对理想的偏移，供 fast_solve 记录/复用
+        域: √(Δα² + Δβ²) ≤ search_radius (总指向偏离上限, 即"偏离人眼"约束)
+        网格: Δα、Δβ 均取 search_step 间距; 全局理想锚直接偏移 (无逐层 β 重算)。
+        排序: 总偏离升序 (环状从内向外), 同环 |Δα| 小者优先 (数据先验: 成功点
+        绝大多数 Δα=0, 优先"保 yaw 调 pitch")。
+        排序键 = hypot(Δα, Δβ) 即真实指向误差 (全局锚直接偏移保证)。
+
+        返回 [(alpha, beta, d_alpha, d_beta), ...] (α/β 已裁剪 [0,180] 重算 d)。
         """
         ideal_alpha, ideal_beta = self._compute_ideal_alpha_beta(x, y, z)
         ideal_alpha = max(0.0, min(180.0, ideal_alpha))
 
-        alpha_offsets = [0.0]
-        for i in range(1, int(self.yaw_levels)):
-            alpha_offsets.extend([i * self.yaw_step, -i * self.yaw_step])
-        alpha_offsets.sort(key=abs)
+        R, S = self.search_radius, self.search_step
+        n_layers = int(R // S)
 
-        out = []
-        for alpha_off in alpha_offsets:
-            alpha = ideal_alpha + alpha_off
-            if not (0.0 <= alpha <= 180.0):
-                continue
-            local_beta = self._compute_beta_for_alpha(x, y, z, alpha)
-            eff_range = self.pitch_range if abs(alpha_off) < 1e-6 else self.pitch_range * 0.5
-            n = int(eff_range / self.pitch_step)
-            betas = [local_beta]
-            for i in range(1, n + 1):
-                betas.extend([local_beta + i * self.pitch_step,
-                              local_beta - i * self.pitch_step])
-            for beta in betas:
-                if 0.0 <= beta <= 180.0:
-                    out.append((alpha, beta,
-                                alpha - ideal_alpha, beta - ideal_beta))
-        return out
+        cands = []
+        for i in range(-n_layers, n_layers + 1):
+            da = i * S
+            beta_lim = math.sqrt(max(0.0, R * R - da * da))
+            m = int(beta_lim // S)
+            for j in range(-m, m + 1):
+                db = j * S
+                alpha = max(0.0, min(180.0, ideal_alpha + da))
+                beta = max(0.0, min(180.0, ideal_beta + db))
+                cands.append((alpha, beta, alpha - ideal_alpha, beta - ideal_beta,
+                              math.hypot(alpha - ideal_alpha, beta - ideal_beta)))
+
+        # 总偏离升序 (主键即真实指向误差), 同偏离 |Δα| 小者优先, 再按 Δβ 符号稳定
+        cands.sort(key=lambda c: (round(c[4], 6), abs(c[2]), c[3]))
+        return [(a, b, da, db) for a, b, da, db, _ in cands]
 
     def _priority_candidates(self, x, y, z):
-        """搜索候选序列: fast_solve 修正锚螺旋在前, 理想锚螺旋兜底 (去重)。"""
-        spiral = self.alpha_beta_candidates(x, y, z)   # 理想锚螺旋
-        ideal_a = spiral[0][0] - spiral[0][2]          # 首候选 d=0 → 反解理想值
-        ideal_b = spiral[0][1] - spiral[0][3]
+        """搜索候选序列: fast_solve 修正锚圆盘在前, 理想锚圆盘兜底 (去重)。"""
+        ideal_a, ideal_b = self._compute_ideal_alpha_beta(x, y, z)
+        ideal_a = max(0.0, min(180.0, ideal_a))
 
         if not self._offset_records:
-            return [(a, b, da, db, None) for a, b, da, db in spiral]
+            return [(a, b, da, db, None)
+                    for a, b, da, db in self.alpha_beta_candidates(x, y, z)]
 
         import fast_solve
         off = fast_solve.weighted_offset(self._offset_records, x, y, z)
         if off is None:
-            rospy.loginfo("  fast_solve: 无门限内邻居, 使用理想锚螺旋")
-            return [(a, b, da, db, None) for a, b, da, db in spiral]
+            rospy.loginfo("  fast_solve: 无门限内邻居, 使用理想锚圆盘")
+            return [(a, b, da, db, None)
+                    for a, b, da, db in self.alpha_beta_candidates(x, y, z)]
         da_bar, db_bar = off
-        rospy.loginfo(f"  fast_solve: 加权偏移 (Δα={da_bar:+.1f}°, Δβ={db_bar:+.1f}°) 重锚螺旋")
+        rospy.loginfo(f"  fast_solve: 加权偏移 (Δα={da_bar:+.1f}°, Δβ={db_bar:+.1f}°) 重锚圆盘")
 
-        # 修正锚螺旋 = 理想锚螺旋整体平移 + 重裁剪 [0,180]
+        # 修正锚圆盘 = 同一圆盘网格整体平移到新锚 + 重裁剪 [0,180]
+        # 排序: 绕重锚中心的环序 (中心即经验最优姿态, 先试中心再向外扩) —
+        # 速度优先: 首候选就是偏移修正后的姿态本身
         # d 值相对几何理想值 (与分析器记录语义一致)
-        reanchored = [
-            (max(0.0, min(180.0, a + da_bar)),
-             max(0.0, min(180.0, b + db_bar)),
-             a + da_bar - ideal_a, b + db_bar - ideal_b, 'fast')
-            for a, b, da, db in spiral]
+        R, S = self.search_radius, self.search_step
+        n_layers = int(R // S)
+        reanchored = []
+        for i in range(-n_layers, n_layers + 1):
+            da = i * S
+            beta_lim = math.sqrt(max(0.0, R * R - da * da))
+            m = int(beta_lim // S)
+            for j in range(-m, m + 1):
+                db = j * S
+                alpha = max(0.0, min(180.0, ideal_a + da_bar + da))
+                beta = max(0.0, min(180.0, ideal_b + db_bar + db))
+                reanchored.append((alpha, beta,
+                                   alpha - ideal_a, beta - ideal_b,
+                                   math.hypot(da, db), abs(da), db, 'fast'))
+        reanchored.sort(key=lambda c: (round(c[4], 6), c[5], c[6]))
+        reanchored = [(a, b, da, db, tag) for a, b, da, db, _, _, _, tag in reanchored]
 
-        # 去重 (偏移极小/为 0 时两螺旋重合)
+        spiral = [(a, b, da, db, None)
+                  for a, b, da, db in self.alpha_beta_candidates(x, y, z)]
+
+        # 去重 (偏移极小/为 0 时两圆盘重合)
         seen, out = set(), []
-        for cand in reanchored + [(a, b, da, db, None) for a, b, da, db in spiral]:
+        for cand in reanchored + spiral:
             key = (round(cand[0], 3), round(cand[1], 3))
             if key not in seen:
                 seen.add(key)

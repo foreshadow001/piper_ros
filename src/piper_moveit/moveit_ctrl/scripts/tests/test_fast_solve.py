@@ -58,8 +58,7 @@ def test_weighted_offset_empty_records():
 def _make_ctrl(records):
     from piper_arm_controller import PiperArmController
     c = object.__new__(PiperArmController)
-    c.yaw_step, c.yaw_levels = 10.0, 3
-    c.pitch_step, c.pitch_range = 5.0, 20.0
+    c.search_radius, c.search_step = 30.0, 10.0
     c.eye_position = (1.1, 0.0, -0.05)
     c._offset_records = records
     return c
@@ -76,16 +75,24 @@ def test_priority_candidates_reanchored_first():
     ideal_a = spiral[0][0] - spiral[0][2]
     ideal_b = spiral[0][1] - spiral[0][3]
 
+    # 重锚圆盘以 ideal+(15,-10) 为中心, 绕中心的环序 → 首候选即中心本身
+    # (速度优先: 直接从经验最优姿态开始试)
     first = cands[0]
-    assert first[4] == 'fast'                       # 修正锚候选在前
-    assert first[0] == pytest.approx(ideal_a + 15.0)  # 锚点被平移
+    assert first[4] == 'fast'                       # 首候选来自重锚圆盘
+    assert first[0] == pytest.approx(ideal_a + 15.0)  # 锚点即首候选
     assert first[1] == pytest.approx(ideal_b - 10.0)
     assert first[2] == pytest.approx(15.0)          # d 值 = 相对几何理想
+    # 后续 'fast' 候选按绕中心的偏离环序 (并列环内次序由决胜键定, 不逐一断言)
+    fast_devs = [math.hypot(c_[0] - (ideal_a + 15.0), c_[1] - (ideal_b - 10.0))
+                 for c_ in cands if c_[4] == 'fast']
+    assert fast_devs[0] == pytest.approx(0.0)
+    for prev, cur in zip(fast_devs, fast_devs[1:]):
+        assert cur >= prev - 1e-6
     assert all(c_[4] is None or c_[4] == 'fast' for c_ in cands)
 
 
 def test_priority_candidates_dedup_zero_offset():
-    """偏移 (0,0) 时修正螺旋与理想螺旋重合 → 去重后仍 29 个。"""
+    """偏移 (0,0) 时修正锚圆盘与理想锚圆盘重合 → 去重后仍 29 个。"""
     from piper_arm_controller import PiperArmController
 
     c = _make_ctrl([(0.40, 0.0, 0.30, 0.0, 0.0)])

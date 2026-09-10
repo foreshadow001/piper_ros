@@ -42,7 +42,7 @@ Two independent arms (`piper_upper`, `piper_lower`) run simultaneously by using 
 - Each arm gets its own CAN port (`can_piper_upper`, `can_piper_lower`), own driver node in its namespace, and own MoveIt instance
 - **`demo.launch`** wraps everything — MoveIt group, `joint_state_filter`, `joint_moveit_ctrl_server`, and CAN driver — inside `<group ns="$(arg can_port)">`. Pass `can_port:=piper_upper` or `can_port:=piper_lower`
 - **`joint_state_filter.py`** strips the `gripper` joint from `/joint_states_single` → `/joint_states_actual` so MoveIt's joint_state_publisher only sees the 6 arm joints
-- Arm-specific config lives in YAML files: [piper_upper.yaml](src/piper_moveit/moveit_ctrl/scripts/cfg/piper_upper.yaml) and [piper_lower.yaml](src/piper_moveit/moveit_ctrl/scripts/cfg/piper_lower.yaml) — eye position, planning timeouts/search steps, safety bbox, obstacles (incl. camera FOV keep-out volumes), workspace sampling params, tool offset, arm-in-camera pose
+- Arm-specific config lives in YAML files: [piper_upper.yaml](src/piper_moveit/moveit_ctrl/scripts/cfg/piper_upper.yaml) and [piper_lower.yaml](src/piper_moveit/moveit_ctrl/scripts/cfg/piper_lower.yaml) — eye position, planning timeouts, disk-search params (`search_radius`/`search_step`), safety bbox, obstacles (incl. camera FOV keep-out volumes), workspace sampling params, tool offset, arm-in-camera pose
 
 ## Key ROS Interfaces (Runtime)
 
@@ -64,6 +64,7 @@ Two independent arms (`piper_upper`, `piper_lower`) run simultaneously by using 
 - `/joint_moveit_ctrl_piper` — combined arm + gripper (7 values)
 - `/joint_moveit_ctrl_endpose` — Cartesian end-pose control (7 values: xyz + quaternion)
 - All use `JointMoveitCtrl.srv`; a `planning_time` field (>0) overrides the server's `~planning_time` param per request
+- Every handler runs a **joint-states rate guard** first: if `joint_states_actual` drops below 10 Hz (CAN disconnected), the request is **rejected** with `status=False, error_code=2` instead of fake-executing against a frozen fake controller (the driver keeps publishing frozen data at low rate after CAN loss — topic liveness and `header.stamp` are NOT valid failure signals; only the publish rate is)
 
 **Intermediary topic:**
 - `/joint_states_actual` — published by `joint_state_filter.py`; strips `gripper` from `/joint_states_single`
@@ -81,7 +82,7 @@ The central Cartesian control class. See [piper_arm_controller.py](src/piper_mov
 - All public move/query/cleanup methods are serialized via an `RLock` (`@_synchronized` decorator) — sharing one instance across threads is safe
 - `search_orientation(x, y, z, try_pose, abort_check)` — the **single** orientation search loop; both runtime modes and `workspace_analyzer` are thin `try_pose` backends (service+verify / plan+execute / plan-only), so sim and real share identical candidate order and abort semantics
 - `fast_solve` — mode-derived (service mode: on; direct/analysis mode: off, no YAML key). Neighbors within `fast_solve.NEIGHBOR_RADIUS` (`resolution·√3`) of the target are inverse-distance-averaged into a single (Δα, Δβ) that **re-anchors** the spiral (whole spiral translated); the ideal-anchor spiral always follows as fallback, deduped. Reads `reachable_range/offsets_<arm>_<config_label>.txt`; falls back to pure spiral when the file is missing/stale (filename embeds `get_config_label()`) or no neighbor passes the radius gate
-- `move_to(x, y, z)` — (α, β) spiral search so the flange Z-axis faces `eye_position` (γ=0); ideal angles computed geometrically, then widened by `yaw_step`/`pitch_step` until planning succeeds
+- `move_to(x, y, z)` — **disk-domain** orientation search: candidates (α₀+Δα, β₀+Δβ) with √(Δα²+Δβ²) ≤ `search_radius` (YAML `arm.search_radius`, default 30°) on a `search_step` grid (default 10°, 29 candidates), global ideal anchor with direct offsets, tried in **total-deviation rings** (best-facing pose first; the sort key *is* the true pointing error)
 - `move_to_with_orientation(x, y, z, α, β, γ)` — explicit Z-X-Z' target, no search
 - `move_to_joints([6 rad values])` — joint-space move
 - `get_current_pose()` / `get_current_zxz()` / `print_current_pose()` — pose queries
@@ -91,6 +92,10 @@ The central Cartesian control class. See [piper_arm_controller.py](src/piper_mov
 - Drives the bridge server's planning timeout via `rospy.set_param("<ns>/joint_moveit_ctrl_server/planning_time", ...)` so unreachable poses fail in ~0.05 s instead of blocking
 - Verifies success by reading `/<ns>/end_pose`: target reached only if distance < 0.02 m
 - Safety walls (6 faces of `safety_bbox`) and obstacles are added via `PlanningSceneInterface` (lazy-init, 2 s timeout). If the scene can't be initialized, the constructor **raises RuntimeError** — the arm never moves without collision constraints (fail-fast by design)
+
+**CAN-disconnect guards (added after a silent 30 s/point incident):**
+- `from_yaml` runs `ensure_joint_states_alive` — a 3 s window rate check on `<ns>/joint_states_actual` (≥10 Hz required, normal is ~200 Hz); constructor fails with a fix hint otherwise. Covers both modes and all callers (analyzer, TCP server, demo scripts)
+- `workspace_analyzer` additionally has a **per-point watchdog**: a single point taking >20 s aborts the analysis (partial results are saved). This catches mid-run CAN loss — with a dead link every `plan()` silently costs ~1 s in MoveIt's CurrentStateMonitor timeout, so 29 candidates ≈ 30 s/point with no error anywhere (the `rosconsole_no_warn.config` suppression also hides the warning)
 
 Note: the `tool` and `arm_in_ccs` YAML entries are consumed by [end_pose_monitor.py](src/piper_moveit/moveit_ctrl/scripts/end_pose_monitor.py), **not** by the controller.
 
@@ -173,6 +178,6 @@ rosrun moveit_ctrl visualize_points.py upper      # interactive file picker; 'g'
 ## Known Issues
 
 - [joint_moveit_ctrl.py](src/piper_moveit/moveit_ctrl/scripts/joint_moveit_ctrl.py) is a legacy demo/prototype script (old yaw-pitch search, 4-wall `SafetyZoneManager`). Production wall logic is `PiperArmController._add_safety_walls()` (6 walls, from `safety_bbox`). Don't copy from it.
-- [joint_moveit_ctrl_server.py](src/piper_moveit/moveit_ctrl/scripts/joint_moveit_ctrl_server.py) calls the driver's `/block_arm` — blocked by default at startup, unblocked only around each move — so the fake controller's residual target pose can't drive the arm on its own (see commit `29ae46c` "Fix No Move ERROR").
-- `piper_arm_controller.py` and `workspace_analyzer.py` suppress MoveIt planning TIMED_OUT warnings by setting `ROSCONSOLE_CONFIG_FILE` (→ `scripts/rosconsole_no_warn.config`) at import time. This must happen before `roscpp` initializes (i.e., before any MoveIt import via rospy).
+- [joint_moveit_ctrl_server.py](src/piper_moveit/moveit_ctrl/scripts/joint_moveit_ctrl_server.py) calls the driver's `/block_arm` — blocked by default at startup, unblocked only around each move — so the fake controller's residual target pose can't drive the arm on its own (see commit `29ae46c` "Fix No Move ERROR"). Its joint-states rate guard requires a **demo.launch restart** to take effect (it's a launch-started node).
+- `piper_arm_controller.py` and `workspace_analyzer.py` suppress MoveIt planning TIMED_OUT warnings by setting `ROSCONSOLE_CONFIG_FILE` (→ `scripts/rosconsole_no_warn.config`) at import time. This must happen before `roscpp` initializes (i.e., before any MoveIt import via rospy). Note this suppression also hides MoveIt's CurrentStateMonitor timeout warnings — the CAN-disconnect guards above exist precisely because that failure mode is otherwise invisible.
 - The `gripper` joint name must match exactly in `joint_state_filter.py` (default: `"gripper"`). Configurable via `~strip_joints` param.
