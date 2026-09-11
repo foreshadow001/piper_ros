@@ -7,6 +7,7 @@ Listens for TCP connections from the Windows host. Supported commands:
     MOVE_JOINTS:<arm>:<j1>,<j2>,<j3>,<j4>,<j5>,<j6>     # joint-space move (rad)
     MOVE_TO:<arm>:<x>,<y>,<z>                              # Cartesian move (m)
     GET_POSE:<arm>                                          # query current flange pose
+    GET_JOINTS:<arm>                                        # query current joint angles (rad)
     SHUTDOWN                                                # exit server
 
 After each movement, queries /<can_port>/end_pose for the actual reached
@@ -15,6 +16,11 @@ flange pose and responds:
     MOVED:<arm>:<x>,<y>,<z>,<qx>,<qy>,<qz>,<qw>,<alpha>,<beta>,<gamma>
 
 Alpha/Beta/Gamma are intrinsic Z-X-Z' Euler angles in degrees.
+
+GET_JOINTS queries /<can_port>/joint_states_actual (rad, gripper stripped)
+and responds:
+
+    JOINTS:<arm>:<j1>,<j2>,<j3>,<j4>,<j5>,<j6>
 
 Usage:
     rosrun moveit_ctrl piper_windows_ctrl_server.py
@@ -27,6 +33,7 @@ import threading
 import yaml
 import rospy
 from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import JointState
 from pathlib import Path
 
 from piper_arm_controller import PiperArmController
@@ -153,6 +160,20 @@ class PiperCtrlServer:
             rospy.logwarn(f"Timeout waiting for {topic}")
             return None
 
+    def _get_current_joints(self, can_port):
+        """Query /joint_states_actual topic (rad, gripper stripped).
+        Returns first 6 joint positions or None."""
+        topic = f"{can_port}/joint_states_actual" if can_port else "joint_states_actual"
+        try:
+            msg = rospy.wait_for_message(topic, JointState, timeout=1.0)
+            if len(msg.position) < 6:
+                rospy.logwarn(f"{topic}: only {len(msg.position)} joints")
+                return None
+            return tuple(msg.position[:6])
+        except rospy.ROSException:
+            rospy.logwarn(f"Timeout waiting for {topic}")
+            return None
+
     def _format_moved_response(self, arm, can_port):
         """Query current pose and format MOVED:... response."""
         pose = self._get_current_flange_pose(can_port)
@@ -186,6 +207,17 @@ class PiperCtrlServer:
                     f"{x:.6f},{y:.6f},{z:.6f},"
                     f"{qx:.6f},{qy:.6f},{qz:.6f},{qw:.6f},"
                     f"{alpha:.4f},{beta:.4f},{gamma:.4f}")
+
+        elif cmd.startswith("GET_JOINTS:"):
+            # "GET_JOINTS:upper" → query current joint angles (rad, no movement)
+            _, arm = cmd.split(":", 1)
+            if arm not in self._ctrls:
+                return f"ERROR:{arm}:unknown arm (available: {list(self._ctrls.keys())})"
+            ctrl = self._ctrls[arm]
+            joints = self._get_current_joints(ctrl.can_port)
+            if joints is None:
+                return f"ERROR:{arm}:no joint data"
+            return "JOINTS:" + arm + ":" + ",".join(f"{j:.6f}" for j in joints)
 
         elif cmd.startswith("MOVE_JOINTS:"):
             # "MOVE_JOINTS:upper:0.0,0.0,0.0,0.0,0.0,0.0"
