@@ -15,9 +15,8 @@ class JointMoveitCtrlServer:
 
         # 关节状态频率守卫: CAN 断开后驱动仍低频发布冻结数据
         # (话题不死、stamp 照填), 必须按窗口频率检测。
-        self._js_count = 0
-        self._js_window_count = 0
-        self._js_window_t0 = rospy.Time.now().to_sec()
+        from collections import deque
+        self._js_times = deque(maxlen=1000)   # ~5s @200Hz, 滑动窗按时间裁剪
         self._js_topic = rospy.resolve_name('joint_states_actual')
         self._js_sub = rospy.Subscriber(
             self._js_topic, JointState, self._js_cb, queue_size=1)
@@ -77,23 +76,22 @@ class JointMoveitCtrlServer:
         rospy.loginfo("Joint MoveIt Control Services Ready.")
 
     def _js_cb(self, msg):
-        self._js_count += 1
+        self._js_times.append(rospy.Time.now().to_sec())
 
     def _joint_states_fresh(self, window=1.0, min_rate=10.0):
-        """关节状态发布频率 ≥ min_rate → True。
+        """滑动时间窗: 最近 window 秒内的消息数 / window ≥ min_rate。
 
         注: 不能用 header.stamp 判新鲜 — CAN 断开后驱动仍低频发布,
         stamp 填的是发送时刻 (内容是冻结的旧关节值), 时间戳是"新"的。
-        必须按窗口内计数测频率 (正常 ~100Hz, 断链后 <1Hz)。
+        滑动窗按回调时刻裁剪, 任意时刻查询都正确 — 无"check 时滚动清零"
+        的竞态 (计数器版会在首次查询时把累积计数清掉, 恒误判 0Hz)。
+        maxlen 上限足够容纳 window 内的正常消息 (200Hz×1s=200) 并允许
+        短暂尖峰; 长时间断链后残留的旧时间戳会被按时间裁掉。
         """
         now = rospy.Time.now().to_sec()
-        # 窗口滚动: 每过 window 秒重置计数
-        if now - self._js_window_t0 >= window:
-            self._js_window_count = self._js_count
-            self._js_window_t0 = now
-            self._js_count = 0
-        rate = self._js_count / max(1e-6, now - self._js_window_t0)
-        return rate >= min_rate
+        while self._js_times and now - self._js_times[0] > window:
+            self._js_times.popleft()
+        return len(self._js_times) / window >= min_rate
 
     def _guard_joint_states(self, arm_label):
         """运动前守卫: 关节状态频率异常时拒绝执行并返回失败。
@@ -104,7 +102,7 @@ class JointMoveitCtrlServer:
         if not self._joint_states_fresh():
             rospy.logerr(
                 f"{arm_label} 拒绝执行: 关节状态话题频率异常 "
-                f"(/{self._js_topic}, 低于 10Hz) — CAN 断开或驱动停止?")
+                f"({self._js_topic}, 低于 10Hz) — CAN 断开或驱动停止?")
             return False
         return True
 
